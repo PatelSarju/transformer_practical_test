@@ -59,6 +59,37 @@ def positional_encoding(sequence_length, d_model):
 
 
 # ============================================================
+# PADDING MASK
+# ============================================================
+
+# Create a padding mask so the attention mechanism does not
+# attend to padding tokens.
+#
+# Token ID 0 is assumed to be the padding token.
+#
+# Input shape:
+#     (batch_size, sequence_length)
+#
+# Output shape:
+#     (batch_size, 1, 1, sequence_length)
+
+def create_padding_mask(tokens):
+
+    # Check which token positions contain the padding token 0.
+    mask = tf.cast(
+        tf.equal(tokens, 0),
+        tf.float32
+    )
+
+    # Add dimensions so the mask can be broadcast
+    # across attention heads and query positions.
+    mask = mask[:, tf.newaxis, tf.newaxis, :]
+
+    # Return the padding mask.
+    return mask
+
+
+# ============================================================
 # MULTI-HEAD ATTENTION
 # ============================================================
 
@@ -78,6 +109,12 @@ class MultiHeadAttention(tf.keras.layers.Layer):
 
         # Store the number of attention heads.
         self.num_heads = num_heads
+
+        # Check that d_model can be evenly divided among heads.
+        if d_model % num_heads != 0:
+            raise ValueError(
+                "d_model must be divisible by num_heads."
+            )
 
         # Calculate the dimension handled by each attention head.
         self.depth = d_model // num_heads
@@ -129,7 +166,7 @@ class MultiHeadAttention(tf.keras.layers.Layer):
 
     # Perform Multi-Head Self-Attention.
 
-    def call(self, x):
+    def call(self, x, mask=None):
 
         # Get the batch size from the input tensor.
         batch_size = tf.shape(x)[0]
@@ -179,6 +216,18 @@ class MultiHeadAttention(tf.keras.layers.Layer):
             scores /
             tf.math.sqrt(depth)
         )
+
+        # Apply the padding mask when it is provided.
+        #
+        # The padding mask marks padding tokens with 1.
+        # Adding -1e9 makes their attention probability
+        # approximately zero after softmax.
+        if mask is not None:
+
+            scaled_scores = (
+                scaled_scores +
+                (mask * -1e9)
+            )
 
         # Convert the scaled scores into attention weights.
         attention_weights = tf.nn.softmax(
@@ -239,6 +288,15 @@ def create_look_ahead_mask(sequence_length):
         0
     )
 
+    # Add dimensions so the mask can work with
+    # multi-head attention.
+    mask = mask[
+        tf.newaxis,
+        tf.newaxis,
+        :,
+        :
+    ]
+
     # Return the look-ahead mask.
     return mask
 
@@ -265,6 +323,12 @@ class MaskedMultiHeadAttention(
 
         # Store the number of attention heads.
         self.num_heads = num_heads
+
+        # Check that d_model can be evenly divided among heads.
+        if d_model % num_heads != 0:
+            raise ValueError(
+                "d_model must be divisible by num_heads."
+            )
 
         # Calculate the dimension handled by each attention head.
         self.depth = d_model // num_heads
@@ -364,8 +428,7 @@ class MaskedMultiHeadAttention(
             tf.math.sqrt(depth)
         )
 
-        # Apply the look-ahead mask so each decoder position
-        # cannot attend to future tokens.
+        # Apply the combined look-ahead and padding mask.
         if mask is not None:
 
             scaled_scores = (
@@ -434,6 +497,12 @@ class CrossAttention(
         # Store the number of attention heads.
         self.num_heads = num_heads
 
+        # Check that d_model can be evenly divided among heads.
+        if d_model % num_heads != 0:
+            raise ValueError(
+                "d_model must be divisible by num_heads."
+            )
+
         # Calculate the dimension handled by each attention head.
         self.depth = d_model // num_heads
 
@@ -487,7 +556,8 @@ class CrossAttention(
     def call(
         self,
         decoder_input,
-        encoder_output
+        encoder_output,
+        mask=None
     ):
 
         # Get the batch size from the Decoder input.
@@ -547,6 +617,14 @@ class CrossAttention(
             scores /
             tf.math.sqrt(depth)
         )
+
+        # Apply the Encoder padding mask.
+        if mask is not None:
+
+            scaled_scores = (
+                scaled_scores +
+                (mask * -1e9)
+            )
 
         # Convert the scaled scores into attention weights.
         attention_weights = tf.nn.softmax(
@@ -649,10 +727,14 @@ class Encoder(tf.keras.layers.Layer):
 
     # Define the processing workflow of the Encoder.
 
-    def call(self, tokens):
+    def call(
+        self,
+        tokens,
+        padding_mask=None
+    ):
 
         # Get the length of the input paragraph token sequence.
-        sequence_length = tokens.shape[1]
+        sequence_length = tf.shape(tokens)[1]
 
         # Convert paragraph token IDs into dense vector representations.
         x = self.embedding(tokens)
@@ -666,9 +748,14 @@ class Encoder(tf.keras.layers.Layer):
         # Add positional information to the token embeddings.
         x = x + position
 
-        # Apply Multi-Head Self-Attention to allow tokens
-        # to gather information from other tokens in the paragraph.
-        attention_output = self.attention(x)
+        # Apply Multi-Head Self-Attention.
+        #
+        # The padding mask prevents attention from using
+        # padded positions.
+        attention_output = self.attention(
+            x,
+            mask=padding_mask
+        )
 
         # Add the attention output to the original representation
         # using a residual connection.
@@ -771,11 +858,12 @@ class Decoder(tf.keras.layers.Layer):
     def call(
         self,
         tokens,
-        encoder_output
+        encoder_output,
+        padding_mask=None
     ):
 
         # Get the length of the Decoder token sequence.
-        sequence_length = tokens.shape[1]
+        sequence_length = tf.shape(tokens)[1]
 
         # Convert Decoder token IDs into dense vector representations.
         x = self.embedding(tokens)
@@ -795,12 +883,26 @@ class Decoder(tf.keras.layers.Layer):
             sequence_length
         )
 
-        # Apply Masked Self-Attention so each Decoder position
-        # can only use the current and previous summary tokens.
+        # Create a padding mask for the Decoder tokens.
+        decoder_padding_mask = create_padding_mask(
+            tokens
+        )
+
+        # Combine the look-ahead mask and padding mask.
+        #
+        # This ensures that the Decoder:
+        # 1. Cannot see future tokens.
+        # 2. Cannot attend to padding tokens.
+        combined_mask = tf.maximum(
+            look_ahead_mask,
+            decoder_padding_mask
+        )
+
+        # Apply Masked Self-Attention.
         masked_attention_output = (
             self.masked_attention(
                 x,
-                mask=look_ahead_mask
+                mask=combined_mask
             )
         )
 
@@ -812,10 +914,14 @@ class Decoder(tf.keras.layers.Layer):
 
         # Apply Cross-Attention so the Decoder can use
         # information from the paragraph Encoder output.
+        #
+        # The encoder padding mask prevents the Decoder
+        # from attending to padded article positions.
         cross_attention_output = (
             self.cross_attention(
                 x,
-                encoder_output
+                encoder_output,
+                mask=padding_mask
             )
         )
 
@@ -892,17 +998,24 @@ class Transformer(tf.keras.Model):
         decoder_tokens
     ):
 
+        # Create a padding mask for the paragraph.
+        paragraph_padding_mask = create_padding_mask(
+            paragraph_tokens
+        )
+
         # Pass the paragraph token IDs through the Encoder
         # to create contextual representations.
         encoder_output = self.encoder(
-            paragraph_tokens
+            paragraph_tokens,
+            padding_mask=paragraph_padding_mask
         )
 
         # Pass the Decoder input and Encoder output through
         # the Decoder to generate summary representations.
         decoder_output = self.decoder(
             decoder_tokens,
-            encoder_output
+            encoder_output,
+            padding_mask=paragraph_padding_mask
         )
 
         # Convert the Decoder representations into logits
@@ -913,3 +1026,7 @@ class Transformer(tf.keras.Model):
 
         # Return the logits for the predicted summary tokens.
         return logits
+    
+    
+    
+    
